@@ -1,0 +1,10 @@
+[project]
+name = "ecosort-ai"
+version = "0.1.0"
+description = "AI-Powered Waste Classification & Recycling"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+
+
