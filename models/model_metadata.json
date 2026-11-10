@@ -1,0 +1,43 @@
+{
+  "exported_at": "2026-11-09T23:06:52.070403+00:00",
+  "model": "yolo26s.pt",
+  "task": "object_detection",
+  "dataset": "Garbage Classification 3 (Roboflow)",
+  "source_weights": "/kaggle/working/runs/detect/runs/train/waste_yolo26s_20261109_1726/weights/best.pt",
+  "onnx_path": "exports/waste_yolo26s.onnx",
+  "onnx_size_mb": 38.16,
+  "onnx_opset": 17,
+  "image_size": 640,
+  "classes": [
+    "biodegradable",
+    "cardboard",
+    "glass",
+    "metal",
+    "paper",
+    "plastic"
+  ],
+  "num_classes": 6,
+  "conf_threshold": 0.35,
+  "iou_threshold": 0.45,
+  "training_epochs": 100,
+  "training_time_min": 338.9,
+  "test_map50": 0.645,
+  "test_map50_95": 0.4491,
+  "test_precision": 0.7238,
+  "test_recall": 0.5738,
+  "optuna_best_trial": 9,
+  "optuna_best_params": {
+    "lr0": 0.0024474916579073796,
+    "lrf": 0.0014254757044027432,
+    "batch": 32,
+    "optimizer": "SGD",
+    "momentum": 0.9632898767244032,
+    "weight_decay": 0.00040489662225846743,
+    "box": 5.932850294430179,
+    "cls": 0.9247912989429843,
+    "dfl": 1.8090133628734761
+  },
+  "optuna_best_map50": 0.5911,
+  "seed": 42,
+  "framework": "ultralytics"
+}
