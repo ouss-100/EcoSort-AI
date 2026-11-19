@@ -1,8 +1,10 @@
 import html
 import streamlit as st
-from app.ui_components import SVG_ICONS, render_header
-from model.labels import CLASS_COLORS_HEX, CLASSES
-from model.model import is_model_available
+from app.components.icons import SVG_ICONS
+from app.components.header import render_header
+from config.settings import DEFAULT_WEIGHTS
+from core.detection.labels import CLASS_COLORS_HEX, CLASSES
+from core.detection.model import is_model_available
 
 
 def render_about_page() -> None:
@@ -103,7 +105,7 @@ The inference engine exposes two primary tuning parameters in the configuration 
                     font-weight: 600;
                 ">
                     <span>{SVG_ICONS['check']}</span>
-                    <span>Weights Verified · models/best.pt</span>
+                    <span>Weights Verified · {DEFAULT_WEIGHTS.relative_to(DEFAULT_WEIGHTS.parent.parent.parent)}</span>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -124,7 +126,7 @@ The inference engine exposes two primary tuning parameters in the configuration 
                     font-weight: 600;
                 ">
                     <span>{SVG_ICONS['alert']}</span>
-                    <span>Missing Weights · models/best.pt</span>
+                    <span>Missing Weights · {DEFAULT_WEIGHTS.relative_to(DEFAULT_WEIGHTS.parent.parent.parent)}</span>
                 </div>
                 """,
                 unsafe_allow_html=True,

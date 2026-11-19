@@ -1,196 +1,402 @@
 import cv2
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
-from app.analytics import init_session_state, reset_session, update_stats
-from app.ui_components import (
-    SVG_ICONS,
-    render_class_chart,
-    render_detection_table,
-    render_header,
-    render_metric_row,
-)
-from model.inference import draw_detections, run_inference
-from model.labels import CLASS_COLORS_HEX, CLASSES
+from datetime import datetime, timezone
+
+from app.state.session import get_session_summary, init_session_state, reset_session, update_stats
+from app.components.icons import SVG_ICONS
+from app.components.header import render_header
+from app.components.metrics import render_metric_row
+from app.components.charts import render_class_chart
+from app.components.tables import render_detection_table
+from app.components.badges import category_badges_html
+from core.detection.inference import draw_detections, run_inference
+from core.detection.labels import CLASS_COLORS_HEX, CLASSES
+
+
+def _init_stream_state() -> None:
+    defaults = {
+        "stream_active":    False,
+        "stream_cam_index": 0,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def _open_capture(cam_index: int) -> bool:
+    """
+    Open the camera and store it in session_state['_cap_obj'].
+    Returns True on success, False if the camera could not be opened.
+    """
+    _release_capture()
+    cap = cv2.VideoCapture(int(cam_index), cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(int(cam_index))
+    if not cap.isOpened():
+        return False
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    st.session_state["_cap_obj"] = cap
+    return True
+
+
+def _release_capture() -> None:
+    """Release and discard any open VideoCapture object."""
+    cap = st.session_state.pop("_cap_obj", None)
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+
+def _read_frame():
+    """
+    Read one frame from the persistent capture object.
+    Returns (ret: bool, frame: ndarray | None).
+    """
+    cap = st.session_state.get("_cap_obj")
+    if cap is None or not cap.isOpened():
+        return False, None
+    for _ in range(2):
+        cap.grab()
+    ret, frame = cap.retrieve()
+    return ret, frame
+
+
+@st.fragment(run_every=0.067)
+def _stream_fragment(model, conf: float, iou: float) -> None:
+    """
+    Isolated fragment that refreshes every ~67 ms.
+    When streaming is inactive it shows a static placeholder — no flicker.
+    """
+    if not st.session_state.get("stream_active", False):
+        st.markdown(
+            f"""
+            <div style="
+                height: 400px;
+                border: 2px dashed #1f2937;
+                border-radius: 12px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #6b7280;
+                font-size: 0.9rem;
+                flex-direction: column;
+                gap: 0.75rem;
+                background: #111827;
+            ">
+                <span style="opacity: 0.55;">{SVG_ICONS['camera']}</span>
+                <span>Press <strong style='color:#f9fafb;'>Start Stream</strong> to begin live detection</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    ret, frame_bgr = _read_frame()
+
+    if not ret or frame_bgr is None:
+        opened = _open_capture(st.session_state.stream_cam_index)
+        if not opened:
+            st.error(
+                "Cannot open camera. "
+                "Check the camera index or grant OS permissions, then restart the stream."
+            )
+            st.session_state.stream_active = False
+            return
+        ret, frame_bgr = _read_frame()
+        if not ret or frame_bgr is None:
+            st.warning("Waiting for first frame…")
+            return
+
+    if model is not None:
+        result = run_inference(model, frame_bgr, conf=conf, iou=iou)
+        if result.error:
+            st.error(f"Inference error: {result.error}")
+            return
+
+        update_stats(result)
+        annotated_bgr = draw_detections(frame_bgr, result)
+        frame_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+        st.image(frame_rgb, channels="RGB", use_container_width=True)
+
+        render_metric_row(
+            {
+                "Objects Detected": result.num_detections,
+                "Inference":        f"{result.inference_ms} ms",
+                "Categories":       len(result.detected_classes),
+            }
+        )
+
+        if result.detected_classes:
+            st.markdown(
+                category_badges_html(result.detected_classes),
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("##### Detection Records")
+        render_detection_table(result)
+
+    else:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        st.image(frame_rgb, channels="RGB", use_container_width=True)
+        st.caption("Model offline — displaying raw feed without inference.")
 
 
 def render_camera_page(model, conf: float, iou: float) -> None:
     init_session_state()
+    _init_stream_state()
 
     render_header(
         title="Live Camera Detection",
         subtitle="Real-time optical feed analysis with YOLO26 inference engine",
     )
 
-    st.markdown(
-        """
-        <div style="
-            background: #111827;
-            border-left: 4px solid #10b981;
-            padding: 0.85rem 1.15rem;
-            border-radius: 6px;
-            color: #d1d5db;
-            font-size: 0.88rem;
-            margin-bottom: 1.5rem;
-            border-top: 1px solid #1f2937;
-            border-right: 1px solid #1f2937;
-            border-bottom: 1px solid #1f2937;
-        ">
-            <strong style="color: #f9fafb;">Workflow:</strong> Position target waste items in the viewfinder, capture a snapshot, then select 
-            <strong style="color: #34d399;">Run Detection</strong> to execute neural inference and extract material telemetry.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if model is None:
+        st.warning("Model offline — camera will display raw feed without inference.")
 
-    # Two-column layout
-    col_left, col_right = st.columns([1, 1], gap="large")
+    ctrl_left, ctrl_mid, ctrl_right = st.columns([1, 1, 2], gap="small")
 
-    with col_left:
-        st.markdown("#### Input Feed")
-        camera_image = st.camera_input(
-            label="Camera viewfinder",
-            key="camera_capture",
-            help="Grant browser permission to access camera device.",
-            label_visibility="collapsed",
+    with ctrl_left:
+        cam_index = st.number_input(
+            "Camera index",
+            min_value=0,
+            max_value=8,
+            value=st.session_state.stream_cam_index,
+            step=1,
+            help="0 = built-in webcam, 1+ = external cameras",
+            disabled=st.session_state.stream_active,
         )
+        st.session_state.stream_cam_index = int(cam_index)
 
-        run_btn = st.button(
-            "Run Detection",
-            type="primary",
-            disabled=(camera_image is None or model is None),
-            use_container_width=True,
-        )
+    with ctrl_mid:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if not st.session_state.stream_active:
+            if st.button(
+                "Start Stream", type="primary",
+                use_container_width=True, key="btn_start",
+            ):
+                opened = _open_capture(st.session_state.stream_cam_index)
+                if opened:
+                    st.session_state.stream_active = True
+                else:
+                    st.error(
+                        f"Could not open camera {st.session_state.stream_cam_index}. "
+                        "Try a different index or check permissions."
+                    )
+                st.rerun()
+        else:
+            if st.button(
+                "Stop Stream", type="secondary",
+                use_container_width=True, key="btn_stop",
+            ):
+                st.session_state.stream_active = False
+                _release_capture()
+                st.rerun()
 
-        if model is None:
-            st.warning("Model offline — inference pipeline is disabled until weights are loaded.")
-
-    with col_right:
-        st.markdown("#### Detection Telemetry")
-
-        if camera_image is not None and run_btn:
-            _process_camera_frame(model, camera_image, conf, iou)
-        elif camera_image is None:
+    with ctrl_right:
+        st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+        if st.session_state.stream_active:
             st.markdown(
-                f"""
-                <div style="
-                    height: 290px;
-                    border: 2px dashed #1f2937;
-                    border-radius: 12px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    color: #9ca3af;
-                    font-size: 0.92rem;
-                    flex-direction: column;
-                    gap: 0.75rem;
-                    background: #111827;
+                """<div style="
+                    display:flex; align-items:center; gap:0.5rem;
+                    background:rgba(16,185,129,0.1);
+                    border:1px solid rgba(16,185,129,0.3);
+                    color:#34d399; padding:0.4rem 0.9rem;
+                    border-radius:9999px; font-size:0.78rem; font-weight:700;
+                    width:fit-content; letter-spacing:0.04em;
                 ">
-                    <span style="opacity: 0.7;">{SVG_ICONS['camera']}</span>
-                    <span>Capture a frame in the viewfinder to initiate analysis</span>
-                </div>
-                """,
+                    <span style="width:8px;height:8px;border-radius:50%;
+                                 background:#10b981;display:inline-block;
+                                 box-shadow:0 0 8px #10b981;"></span>
+                    STREAMING LIVE
+                </div>""",
                 unsafe_allow_html=True,
             )
         else:
-            st.info("Frame captured. Click 'Run Detection' to analyze.")
-
-    # Session stats at the bottom
-    st.markdown("---")
-    st.markdown("#### Session Cumulative Performance")
-    _render_session_stats()
-
-
-
-def _process_camera_frame(model, camera_image, conf: float, iou: float) -> None:
-    pil_img = Image.open(camera_image)
-    frame_rgb = np.array(pil_img)
-    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-    with st.spinner("Executing neural inference..."):
-        result = run_inference(model, frame_bgr, conf=conf, iou=iou)
-
-    if result.error:
-        st.error(f"Inference pipeline error: {result.error}")
-        return
-
-    update_stats(result)
-
-    annotated_bgr = draw_detections(frame_bgr, result)
-    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    st.image(annotated_rgb, caption="Annotated Inference Frame", use_container_width=True)
-
-    render_metric_row(
-        {
-            "Objects Identified": result.num_detections,
-            "Latency": f"{result.inference_ms} ms",
-            "Categories Found": len(result.detected_classes),
-        }
-    )
-
-    if result.detected_classes:
-        badges = []
-        for c in sorted(result.detected_classes):
-            color = CLASS_COLORS_HEX.get(c, "#9ca3af")
-            badges.append(
-                f"""<span style="
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 0.4rem;
-                    background: #111827;
-                    border: 1px solid #1f2937;
-                    padding: 0.3rem 0.65rem;
-                    border-radius: 6px;
-                    font-size: 0.82rem;
-                    font-weight: 600;
-                    color: #f3f4f6;
-                    margin-right: 0.4rem;
-                    margin-bottom: 0.4rem;
+            st.markdown(
+                """<div style="
+                    display:flex; align-items:center; gap:0.5rem;
+                    background:rgba(107,114,128,0.1); border:1px solid #374151;
+                    color:#6b7280; padding:0.4rem 0.9rem;
+                    border-radius:9999px; font-size:0.78rem; font-weight:700;
+                    width:fit-content; letter-spacing:0.04em;
                 ">
-                    <span style="width: 8px; height: 8px; border-radius: 50%; background: {color};"></span>
-                    {c.capitalize()}
-                </span>"""
+                    <span style="width:8px;height:8px;border-radius:50%;
+                                 background:#6b7280;display:inline-block;"></span>
+                    IDLE
+                </div>""",
+                unsafe_allow_html=True,
             )
+
+    st.markdown("---")
+
+    _stream_fragment(model, conf, iou)
+
+    st.markdown("---")
+    st.markdown("#### Session Analytics")
+    _render_session_analytics()
+
+
+def _render_session_analytics() -> None:
+    summary      = get_session_summary()
+    class_counts = summary.get("class_counts", {})
+    times        = st.session_state.get("inference_times", [])
+
+    render_metric_row({
+        "Total Detections":  summary["total_detections"],
+        "Frames Analyzed":   summary["frames_processed"],
+        "Mean Latency":      f"{summary['avg_inference_ms']} ms",
+        "Unique Categories": len([c for c, v in class_counts.items() if v > 0]),
+    })
+
+    if summary["total_detections"] == 0:
         st.markdown(
-            f"""<div style="margin: 0.75rem 0 1rem 0;">{''.join(badges)}</div>""",
+            f"""
+            <div style="
+                border: 2px dashed #1f2937;
+                border-radius: 12px;
+                padding: 2.5rem 1.5rem;
+                text-align: center;
+                background: #111827;
+                color: #9ca3af;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 0.75rem;
+                margin-top: 1rem;
+            ">
+                <span style="opacity: 0.65;">{SVG_ICONS['chart']}</span>
+                <span style="font-size: 1rem; font-weight: 700; color: #f9fafb;">
+                    No session data yet
+                </span>
+                <span style="font-size: 0.85rem; color: #6b7280; max-width: 440px;">
+                    Start the live stream and run detections to populate analytics,
+                    latency benchmarks, and category distributions.
+                </span>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
+        return
 
-    st.markdown("##### Detection Records")
-    render_detection_table(result)
+    st.markdown("---")
 
-    if result.detections:
-        st.markdown("##### Frequency by Category")
-        render_class_chart(result.detections)
+    col_left, col_right = st.columns([1, 1], gap="large")
 
+    with col_left:
+        st.markdown("#### Category Distribution")
+        _render_class_bar_horizontal(class_counts)
 
-def _render_session_stats() -> None:
-    total_det = st.session_state.get("total_detections", 0)
-    frames = st.session_state.get("frames_processed", 0)
-    class_counts = st.session_state.get("class_counts", {})
-    times = st.session_state.get("inference_times", [])
-    avg_ms = round(sum(times) / len(times), 1) if times else 0.0
+        st.markdown("#### Classification Breakdown")
+        _render_class_table(class_counts, summary["total_detections"])
 
-    render_metric_row(
-        {
-            "Total Objects": total_det,
-            "Frames Analyzed": frames,
-            "Average Latency": f"{avg_ms} ms",
-        }
-    )
+    with col_right:
+        st.markdown("#### Inference Latency Timeline")
+        _render_latency_timeline(times)
 
-    if class_counts:
-        st.markdown("##### Cumulative Distribution")
-        chart_data = {
-            cls.capitalize(): class_counts.get(cls, 0)
-            for cls in CLASSES
-        }
-        df = pd.DataFrame.from_dict(chart_data, orient="index", columns=["Detections"])
-        df = df[df["Detections"] > 0]
-        if not df.empty:
-            st.bar_chart(df, horizontal=True, color="#10b981")
+        st.markdown("#### Category Frequency")
+        _render_class_bar_vertical(class_counts)
 
-    if st.button("Reset Session Stats", key="reset_camera"):
+    st.markdown("---")
+    st.markdown("#### Export Telemetry Data")
+    _render_export(summary)
+
+    st.markdown("---")
+    if st.button(
+        "Purge Session Telemetry", type="secondary",
+        use_container_width=True, key="reset_camera_stream",
+    ):
         reset_session()
         st.rerun()
+
+
+def _render_class_table(class_counts: dict, total: int) -> None:
+    rows = []
+    for cls in CLASSES:
+        count = class_counts.get(cls, 0)
+        pct   = 100 * count / total if total > 0 else 0.0
+        rows.append({
+            "Category":  cls.capitalize(),
+            "Count":     count,
+            "Share (%)": f"{pct:.1f}%",
+        })
+    df = pd.DataFrame(rows).sort_values("Count", ascending=False)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def _render_class_bar_horizontal(class_counts: dict) -> None:
+    data = {
+        cls.capitalize(): class_counts.get(cls, 0)
+        for cls in CLASSES
+        if class_counts.get(cls, 0) > 0
+    }
+    if not data:
+        st.info("No distribution data available.")
+        return
+    df = pd.DataFrame.from_dict(data, orient="index", columns=["Detections"])
+    st.bar_chart(df, color="#10b981", horizontal=True)
+
+
+def _render_class_bar_vertical(class_counts: dict) -> None:
+    data = {cls.capitalize(): class_counts.get(cls, 0) for cls in CLASSES}
+    df   = pd.DataFrame.from_dict(data, orient="index", columns=["Detections"])
+    df   = df[df["Detections"] > 0]
+    if df.empty:
+        st.info("No category data available.")
+        return
+    st.bar_chart(df, color="#10b981")
+
+
+def _render_latency_timeline(times: list) -> None:
+    if not times:
+        st.info("No inference timing records logged.")
+        return
+    df = pd.DataFrame({"Frame": range(1, len(times) + 1), "Latency (ms)": times})
+    df = df.set_index("Frame")
+    st.line_chart(df, color="#10b981")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Min",  f"{min(times):.1f} ms")
+    c2.metric("Mean", f"{sum(times)/len(times):.1f} ms")
+    c3.metric("Max",  f"{max(times):.1f} ms")
+
+
+def _render_export(summary: dict) -> None:
+    col_json, col_csv = st.columns(2)
+
+    report = {
+        "exported_at":      datetime.now(timezone.utc).isoformat(),
+        "total_detections": summary["total_detections"],
+        "frames_processed": summary["frames_processed"],
+        "avg_inference_ms": summary["avg_inference_ms"],
+        "class_counts":     summary["class_counts"],
+    }
+    json_str = json.dumps(report, indent=2)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    with col_json:
+        st.download_button(
+            label="Download JSON Telemetry",
+            data=json_str,
+            file_name=f"ecosort_telemetry_{ts}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="dl_json_cam",
+        )
+
+    rows    = [{"class": cls, "count": summary["class_counts"].get(cls, 0)} for cls in CLASSES]
+    csv_str = pd.DataFrame(rows).to_csv(index=False)
+    with col_csv:
+        st.download_button(
+            label="Download CSV Dataset",
+            data=csv_str,
+            file_name=f"ecosort_classes_{ts}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_csv_cam",
+        )

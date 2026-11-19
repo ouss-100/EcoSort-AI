@@ -1,25 +1,35 @@
 import atexit
+import io
 import tempfile
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
 import cv2
+import numpy as np
 import pandas as pd
 import streamlit as st
-from app.analytics import init_session_state, update_stats
-from model.inference import Detection, draw_detections, run_inference
-from app.ui_components import (
-    render_class_chart,
-    render_header,
-    render_metric_row,
-)
+from PIL import Image
+
+from app.state.session import init_session_state, update_stats
+from app.components.header import render_header
+from app.components.metrics import render_metric_row
+from app.components.charts import render_class_chart
+from app.components.tables import render_detection_table
+from app.components.badges import category_badges_html
+from config.settings import DEFAULT_WEIGHTS
+from core.detection.inference import Detection, draw_detections, run_inference
+from core.detection.labels import CLASS_COLORS_HEX
 
 QUALITY_PRESETS: Dict[str, Optional[Tuple[int, int]]] = {
     "Original": None,
     "720p (HD)": (1280, 720),
     "480p (SD)": (854, 480),
 }
+
+IMAGE_TYPES = ["jpg", "jpeg", "png", "bmp", "webp", "tiff"]
+VIDEO_TYPES = ["mp4", "avi", "mov", "mkv"]
 
 
 def render_video_page(model, conf: float, iou: float) -> None:
@@ -35,12 +45,23 @@ def render_video_page(model, conf: float, iou: float) -> None:
             "Model weights not loaded — detection pipeline will be skipped during processing.",
         )
 
+    tab_video, tab_image = st.tabs(["Video", "Image"])
+
+    with tab_video:
+        _render_video_tab(model, conf, iou)
+
+    with tab_image:
+        _render_image_tab(model, conf, iou)
+
+
+def _render_video_tab(model, conf: float, iou: float) -> None:
     st.markdown("#### Input Footage")
     uploaded_file = st.file_uploader(
         "Upload Video Source",
-        type=["mp4", "avi", "mov", "mkv"],
+        type=VIDEO_TYPES,
         help="Supported containers: MP4, AVI, MOV, MKV. Maximum file size: 500 MB.",
         label_visibility="collapsed",
+        key="video_uploader",
     )
 
     if uploaded_file is None:
@@ -61,31 +82,25 @@ def render_video_page(model, conf: float, iou: float) -> None:
         if not cap.isOpened():
             st.error("Could not open the uploaded video. Please verify the codec and format.")
             return
-
-        fps        = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        width      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration   = total_frames / fps if fps > 0 else 0
+        duration     = total_frames / fps if fps > 0 else 0
         cap.release()
     except Exception as exc:
         st.error(f"Error reading video metadata: {exc}")
         return
 
     _render_video_info(uploaded_file.name, duration, fps, width, height, total_frames)
-
     st.markdown("---")
 
     st.markdown("#### Processing Parameters")
     col1, col2, col3 = st.columns(3)
-
     with col1:
         frame_skip = st.slider(
             "Sampling Stride (Every N Frames)",
-            min_value=1,
-            max_value=10,
-            value=1,
-            step=1,
+            min_value=1, max_value=10, value=1, step=1,
             help="Higher values accelerate inference throughput but reduce detection frequency.",
         )
     with col2:
@@ -104,27 +119,140 @@ def render_video_page(model, conf: float, iou: float) -> None:
         type="primary",
         use_container_width=True,
         disabled=(model is None),
+        key="btn_process_video",
     )
 
     if model is None:
-        st.caption("Place best.pt in models/ directory to activate detection engine.")
+        st.caption(f"Place best.pt in {DEFAULT_WEIGHTS.parent} to activate detection engine.")
 
     if process_btn:
         output_path, all_detections, stats = _process_video(
-            tfile,
-            model,
-            conf,
-            iou,
-            fps,
-            width,
-            height,
-            total_frames,
-            frame_skip,
-            QUALITY_PRESETS[quality_choice],
-            show_annotations,
+            tfile, model, conf, iou,
+            fps, width, height, total_frames,
+            frame_skip, QUALITY_PRESETS[quality_choice], show_annotations,
         )
         if output_path:
-            _render_results(tfile, output_path, all_detections, stats)
+            _render_video_results(tfile, output_path, all_detections, stats)
+
+
+def _render_image_tab(model, conf: float, iou: float) -> None:
+    st.markdown("#### Input Image")
+    uploaded_img = st.file_uploader(
+        "Upload Image",
+        type=IMAGE_TYPES,
+        help="Supported formats: JPG, PNG, BMP, WEBP, TIFF.",
+        label_visibility="collapsed",
+        key="image_uploader",
+    )
+
+    if uploaded_img is None:
+        return
+
+    pil_img = Image.open(uploaded_img)
+    w, h = pil_img.size
+    st.markdown("#### Source Metadata")
+    render_metric_row(
+        {
+            "File Name": uploaded_img.name,
+            "Resolution": f"{w}×{h}",
+            "Format": pil_img.format or Path(uploaded_img.name).suffix.upper().lstrip("."),
+            "Size": f"{uploaded_img.size / 1024:.1f} KB",
+        }
+    )
+
+    st.markdown("---")
+
+    show_annotations = st.toggle("Overlay Bounding Boxes", value=True, key="img_annotations")
+
+    run_btn = st.button(
+        "Run Detection",
+        type="primary",
+        use_container_width=True,
+        disabled=(model is None),
+        key="btn_run_image",
+    )
+
+    if model is None:
+        st.caption(f"Place best.pt in {DEFAULT_WEIGHTS.parent} to activate detection engine.")
+
+    if run_btn:
+        _process_image(pil_img, uploaded_img.name, model, conf, iou, show_annotations)
+
+
+def _process_image(
+    pil_img: Image.Image,
+    filename: str,
+    model,
+    conf: float,
+    iou: float,
+    show_annotations: bool,
+) -> None:
+    frame_rgb = np.array(pil_img.convert("RGB"))
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+    with st.spinner("Running inference..."):
+        result = run_inference(model, frame_bgr, conf=conf, iou=iou)
+
+    if result.error:
+        st.error(f"Inference error: {result.error}")
+        return
+
+    update_stats(result)
+
+    st.markdown("---")
+    st.markdown("#### Detection Output")
+
+    col_orig, col_ann = st.columns(2)
+    with col_orig:
+        st.markdown("**Original Image**")
+        st.image(frame_rgb, use_container_width=True)
+    with col_ann:
+        st.markdown("**Annotated Inference**")
+        if show_annotations and result.detections:
+            annotated_bgr = draw_detections(frame_bgr, result)
+            annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+            st.image(annotated_rgb, use_container_width=True)
+        else:
+            st.image(frame_rgb, use_container_width=True)
+            if not result.detections:
+                st.info("No items detected.")
+
+    st.markdown("---")
+    render_metric_row(
+        {
+            "Objects Detected": result.num_detections,
+            "Inference Latency": f"{result.inference_ms} ms",
+            "Categories Found": len(result.detected_classes),
+        }
+    )
+
+    if result.detected_classes:
+        st.markdown(
+            category_badges_html(result.detected_classes),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("#### Detection Records")
+    render_detection_table(result)
+
+    if result.detections:
+        st.markdown("#### Category Distribution")
+        render_class_chart(result.detections)
+
+    if show_annotations and result.detections:
+        annotated_bgr = draw_detections(frame_bgr, result)
+        annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+        out_pil = Image.fromarray(annotated_rgb)
+        buf = io.BytesIO()
+        out_pil.save(buf, format="PNG")
+        st.download_button(
+            label="Download Annotated Image (PNG)",
+            data=buf.getvalue(),
+            file_name=f"ecosort_{Path(filename).stem}_annotated.png",
+            mime="image/png",
+            use_container_width=True,
+        )
+
 
 def _cleanup_prev_temp() -> None:
     prev = st.session_state.pop("_video_temp_path", None)
@@ -184,18 +312,19 @@ def _process_video(
     show_annotations: bool,
 ) -> Tuple[Optional[str], List[Detection], Dict]:
     out_width, out_height = _compute_output_size(orig_width, orig_height, quality_preset)
-    out_path = str(Path(input_path).with_stem(Path(input_path).stem + "_processed").with_suffix(".mp4"))
+    out_path = str(
+        Path(input_path).with_stem(Path(input_path).stem + "_processed").with_suffix(".mp4")
+    )
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (out_width, out_height))
-
-    cap = cv2.VideoCapture(input_path)
+    cap    = cv2.VideoCapture(input_path)
 
     progress_bar = st.progress(0.0, text="Initializing processing pipeline...")
     status_text  = st.empty()
 
     all_detections: List[Detection] = []
-    inference_times: List[float] = []
+    inference_times: List[float]    = []
     frame_idx = 0
     written   = 0
     t_start   = time.perf_counter()
@@ -211,7 +340,6 @@ def _process_video(
                 progress = min(frame_idx / max(total_frames, 1), 1.0)
                 progress_bar.progress(progress, text=f"Processing frame {frame_idx} of {total_frames}...")
 
-            # Resize if needed
             if (out_width, out_height) != (orig_width, orig_height):
                 frame = cv2.resize(frame, (out_width, out_height))
 
@@ -239,7 +367,9 @@ def _process_video(
     avg_fps = round(written / elapsed, 1) if elapsed > 0 else 0.0
 
     progress_bar.progress(1.0, text="Processing completed successfully")
-    status_text.success(f"Processed {written} frames in {elapsed:.1f}s ({avg_fps} FPS average throughput)")
+    status_text.success(
+        f"Processed {written} frames in {elapsed:.1f}s ({avg_fps} FPS average throughput)"
+    )
 
     stats = {
         "frames_written": written,
@@ -251,7 +381,7 @@ def _process_video(
     return out_path, all_detections, stats
 
 
-def _render_results(
+def _render_video_results(
     original_path: str,
     processed_path: str,
     all_detections: List[Detection],
@@ -261,10 +391,8 @@ def _render_results(
     st.markdown("#### Output Inspection")
 
     tab_annotated, tab_comparison = st.tabs(["Annotated Stream", "Side-by-Side Comparison"])
-
     with tab_annotated:
         st.video(processed_path)
-
     with tab_comparison:
         col_orig, col_proc = st.columns(2)
         with col_orig:
@@ -279,7 +407,7 @@ def _render_results(
         if file_size_mb > 200:
             st.warning(
                 f"Processed output file size is {file_size_mb:.0f} MB. "
-                "Download may take some time depending on network throughput.",
+                "Download may take some time."
             )
 
         def _video_stream(path: str, chunk: int = 1 << 20):
@@ -323,7 +451,6 @@ def _render_results(
         ]
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
-
         st.markdown("##### Category Breakdown")
         render_class_chart(all_detections)
     else:

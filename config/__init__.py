@@ -1,12 +1,10 @@
 from config.settings import (
     CONF_THRESHOLD,
     DEFAULT_WEIGHTS,
-    EXPORTS_DIR,
     IMAGE_SIZE,
     IOU_THRESHOLD,
     LOG_FORMAT,
     LOG_LEVEL,
-    LOGS_DIR,
     MODELS_DIR,
     ROOT_DIR,
     SUPPORTED_VIDEO_EXTS,
@@ -15,8 +13,18 @@ from config.settings import (
 __all__ = [
     "ROOT_DIR",
     "MODELS_DIR",
-    "EXPORTS_DIR",
-    "LOGS_DIR",
+    "DEFAULT_WEIGHTS",
+    "CONF_THRESHOLD",
+    "IOU_THRESHOLD",
+    "IMAGE_SIZE",
+    "LOG_LEVEL",
+    "LOG_FORMAT",
+    "SUPPORTED_VIDEO_EXTS",
+]
+
+__all__ = [
+    "ROOT_DIR",
+    "MODELS_DIR",
     "DEFAULT_WEIGHTS",
     "CONF_THRESHOLD",
     "IOU_THRESHOLD",

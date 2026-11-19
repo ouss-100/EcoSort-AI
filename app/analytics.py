@@ -1,7 +1,7 @@
 from collections import defaultdict
 from typing import Dict
 import streamlit as st
-from model.labels import CLASSES
+from core.detection.labels import CLASSES
 
 
 def init_session_state() -> None:

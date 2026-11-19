@@ -30,5 +30,5 @@ testpaths = ["tests"]
 addopts   = "-v --tb=short"
 
 [tool.coverage.run]
-source = ["model", "src", "app", "config"]
+source = ["core", "model", "src", "app", "config"]
 omit   = ["tests/*", "notebooks/*"]

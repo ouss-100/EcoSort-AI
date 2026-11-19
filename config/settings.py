@@ -3,11 +3,8 @@ from pathlib import Path
 
 ROOT_DIR      = Path(__file__).parent.parent
 MODELS_DIR    = ROOT_DIR / "models"
-DATA_DIR      = ROOT_DIR / "data"
-LOGS_DIR      = ROOT_DIR / "logs"
-EXPORTS_DIR   = ROOT_DIR / "exports"
 
-DEFAULT_WEIGHTS = MODELS_DIR / "best.pt"
+DEFAULT_WEIGHTS = MODELS_DIR / "weights" / "best.pt"
 
 CONF_THRESHOLD  = 0.35   # minimum detection confidence
 IOU_THRESHOLD   = 0.45   # NMS IoU threshold
